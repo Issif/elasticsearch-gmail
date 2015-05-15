@@ -7,20 +7,20 @@ import calendar
 import email.utils
 import mailbox
 import email
-
+import logging
 
 http_client = HTTPClient()
 
 DEFAULT_BATCH_SIZE = 500
-ES_URL = "http://localhost:9200/gmail"
-
+DEFAULT_ES_URL = "http://localhost:9200"
+DEFAULT_INDEX_NAME = "gmail"
 
 def delete_index():
     try:
-        body = {"refresh": True}
-        request = HTTPRequest(ES_URL, method="DELETE", body=json.dumps(body), request_timeout=240)
+        url = "%s/%s?refresh=true" % (tornado.options.options.es_url, tornado.options.options.index_name)
+        request = HTTPRequest(url, method="DELETE", request_timeout=240)
         response = http_client.fetch(request)
-        print 'Delete index done   %s' % response.body
+        logging.info('Delete index done   %s' % response.body)
     except:
         pass
 
@@ -30,48 +30,53 @@ def create_index():
 
     schema = {
         "settings": {
-            "number_of_shards": 2,
+            "number_of_shards": 1,
             "number_of_replicas": 0
         },
         "mappings": {
             "email": {
                 "_source": {"enabled": True},
+                "_timestamp" : {"enabled" : True, "path" : "date_ts"},
                 "properties": {
-                    "from": {"type": "string", "index": "not_analyzed"},
-                    "return-path": {"type": "string", "index": "not_analyzed"},
-                    "delivered-to": {"type": "string", "index": "not_analyzed"},
+                    "from": {"type": "string", "fields": {"raw": {"type": "string", "index": "not_analyzed","ignore_above": 256}}},
+                    "return-path": {"type": "string", "fields": {"raw": {"type": "string", "index": "not_analyzed","ignore_above": 256}}},
+                    "delivered-to": {"type": "string", "fields": {"raw": {"type": "string", "index": "not_analyzed","ignore_above": 256}}},
                     "message-id": {"type": "string", "index": "not_analyzed"},
-                    "to": {"type": "string", "index": "not_analyzed"},
-                    "date_ts": {"type": "date"},
-                },
-            }
-        },
-        "refresh": True
+                    "labels" : {"type": "string"},
+                    "to": {"type": "string", "fields": {"raw": {"type": "string", "index": "not_analyzed","ignore_above": 256}}},
+                    "date_ts": {"type": "date", "format": "dateOptionalTime"},
+                    "subject": {"type": "string", "fields": {"raw": {"type": "string", "index": "not_analyzed","ignore_above": 256}}}
+                    }
+                }
+        }
     }
 
     body = json.dumps(schema)
-    request = HTTPRequest(ES_URL, method="PUT", body=body, request_timeout=240)
-    response = http_client.fetch(request)
-    print 'Create index done   %s' % response.body
+    url = "%s/%s" % (tornado.options.options.es_url, tornado.options.options.index_name)
+    try:
+        request = HTTPRequest(url, method="PUT", body=body, request_timeout=240)
+        response = http_client.fetch(request)
+        logging.info('Create index done   %s' % response.body)
+    except:
+        pass
+
 
 total_uploaded = 0
-
-
 def upload_batch(upload_data):
     upload_data_txt = ""
     for item in upload_data:
-        cmd = {'index': {'_index': 'gmail', '_type': 'email', '_id': item['message-id']}}
+        cmd = {'index': {'_index': tornado.options.options.index_name, '_type': 'email', '_id': item['message-id']}}
         upload_data_txt += json.dumps(cmd) + "\n"
         upload_data_txt += json.dumps(item) + "\n"
 
-    request = HTTPRequest("http://localhost:9200/_bulk", method="POST", body=upload_data_txt, request_timeout=240)
+    request = HTTPRequest(tornado.options.options.es_url + "/_bulk", method="POST", body=upload_data_txt, request_timeout=240)
     response = http_client.fetch(request)
     result = json.loads(response.body)
 
     global total_uploaded
     total_uploaded += len(upload_data)
     res_txt = "OK" if not result['errors'] else "FAILED"
-    print "Upload: %s - upload took: %4dms, total messages uploaded: %6d" % (res_txt, result['took'], total_uploaded)
+    logging.info("Upload: %s - upload took: %4dms, total messages uploaded: %6d" % (res_txt, result['took'], total_uploaded))
 
 
 def normalize_email(email_in):
@@ -82,7 +87,7 @@ def normalize_email(email_in):
 def convert_msg_to_json(msg):
     result = {'parts': []}
     if not 'message-id' in msg:
-        return False
+        return None
 
     for (k, v) in msg.items():
         result[k.lower()] = v.decode('utf-8', 'ignore')
@@ -97,10 +102,12 @@ def convert_msg_to_json(msg):
         result['from'] = normalize_email(result['from'])
 
     if "date" in result:
-        tt = email.utils.parsedate_tz(result['date'])
-        if tt:
-            tz = tt[9] if len(tt) == 10 else 0
+        try:
+            tt = email.utils.parsedate_tz(result['date'])
+            tz = tt[9] if len(tt) == 10 and tt[9] else 0
             result['date_ts'] = int(calendar.timegm(tt) - tz) * 1000
+        except:
+            return None
 
     labels = []
     if "x-gmail-labels" in result:
@@ -120,13 +127,15 @@ def load_from_file():
 
     if tornado.options.options.init:
         delete_index()
-        create_index()
+    create_index()
+
 
     if tornado.options.options.skip:
-        print "Skipping first %d messages from mbox file" % tornado.options.options.skip
+        logging.info("Skipping first %d messages from mbox file" % tornado.options.options.skip)
 
     count = 0
     upload_data = list()
+    logging.info("Starting import from file %s" % tornado.options.options.infile)
     mbox = mailbox.UnixMailbox(open(tornado.options.options.infile, 'rb'), email.message_from_file)
     for msg in mbox:
         count += 1
@@ -135,42 +144,36 @@ def load_from_file():
         item = convert_msg_to_json(msg)
         if item:
             upload_data.append(item)
-        if len(upload_data) == tornado.options.options.batch_size:
-            upload_batch(upload_data)
-            upload_data = list()
+            if len(upload_data) == tornado.options.options.batch_size:
+                upload_batch(upload_data)
+                upload_data = list()
 
     # upload remaining items in `upload_batch`
     if upload_data:
         upload_batch(upload_data)
 
-    print "Done - total count %d" % count
+    logging.info("Import done - total count %d" % count)
 
 
 if __name__ == '__main__':
 
-    tornado.options.define(
-        "infile",
-        type=str,
-        default=None,
-        help="The mbox input file")
+    tornado.options.define("es_url", type=str, default=DEFAULT_ES_URL,
+                           help="URL of your Elasticsearch node")
 
-    tornado.options.define(
-        "init",
-        type=bool,
-        default=False,
-        help="Delete and re-initialize the Elasticsearch index")
+    tornado.options.define("index_name", type=str, default=DEFAULT_INDEX_NAME,
+                           help="Name of the index to store your messages")
 
-    tornado.options.define(
-        "batch_size",
-        type=int,
-        default=DEFAULT_BATCH_SIZE,
-        help="Elasticsearch bulk index batch size")
+    tornado.options.define("infile", type=str, default=None,
+                           help="The mbox input file")
 
-    tornado.options.define(
-        "skip",
-        type=int,
-        default=0,
-        help="Number of messages to skip from the mbox file")
+    tornado.options.define("init", type=bool, default=False,
+                           help="Force deleting and re-initializing the Elasticsearch index")
+
+    tornado.options.define("batch_size", type=int, default=DEFAULT_BATCH_SIZE,
+                           help="Elasticsearch bulk index batch size")
+
+    tornado.options.define("skip", type=int, default=0,
+                           help="Number of messages to skip from the mbox file")
 
     tornado.options.parse_command_line()
 
@@ -178,3 +181,5 @@ if __name__ == '__main__':
         IOLoop.instance().run_sync(load_from_file)
     else:
         tornado.options.print_help()
+
+
